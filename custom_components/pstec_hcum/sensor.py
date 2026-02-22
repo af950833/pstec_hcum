@@ -434,11 +434,49 @@ class PstecUsageSensor(SensorEntity):
         elif self._record_type == "act":
             self._state = round(max(0.0, act_now - baseline), 3)
         elif self._record_type == "fct":
+            # Forecast usage for the *metering cycle* (from last meter reading day to next meter reading day).
+            # If we're very close to the meter reading moment (<= 18 hours since cycle start),
+            # show last month's actual usage instead of a noisy projection.
             act_used = to_float_state(f"sensor.{self._device}_act_tmon_total", 0.0)
+            lmon_act = to_float_state(f"sensor.{self._device}_act_lmon_total", 0.0)
+
             now = datetime.datetime.now()
-            day = max(1, now.day)
-            days_in_month = calendar.monthrange(now.year, now.month)[1]
-            self._state = round((act_used / day) * days_in_month, 2)
+
+            # Determine last/next meter reading datetime (00:00 at the meter day).
+            meter_day = int(self._meter_day)
+
+            def _safe_day(y: int, m: int, d: int) -> int:
+                dim = calendar.monthrange(y, m)[1]
+                return min(max(1, d), dim)
+
+            if now.day >= meter_day:
+                last_y, last_m = now.year, now.month
+            else:
+                # previous month
+                if now.month == 1:
+                    last_y, last_m = now.year - 1, 12
+                else:
+                    last_y, last_m = now.year, now.month - 1
+
+            last_dt = datetime.datetime(last_y, last_m, _safe_day(last_y, last_m, meter_day), 0, 0, 0)
+
+            # next meter reading is one month after last_dt on meter_day
+            if last_m == 12:
+                next_y, next_m = last_y + 1, 1
+            else:
+                next_y, next_m = last_y, last_m + 1
+            next_dt = datetime.datetime(next_y, next_m, _safe_day(next_y, next_m, meter_day), 0, 0, 0)
+
+            elapsed_hours = (now - last_dt).total_seconds() / 3600.0
+            total_days = max(1.0, (next_dt - last_dt).total_seconds() / 86400.0)
+            elapsed_days = max(0.001, (now - last_dt).total_seconds() / 86400.0)
+
+            if elapsed_hours <= 18.0:
+                # Right after meter reading: report last month's actual usage.
+                self._state = round(lmon_act, 1)
+            else:
+                # Project current-cycle usage to full cycle length.
+                self._state = round((act_used / elapsed_days) * total_days, 1)
         else:
             self._state = 0.0
 
@@ -591,4 +629,3 @@ async def async_setup_entry(hass, entry, async_add_entities):
             _LOGGER.error("file_saving_callback 오류: %s", e)
 
     async_track_time_change(hass, file_saving_callback, hour=0, minute=0, second=0)
-
