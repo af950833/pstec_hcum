@@ -1,0 +1,6 @@
+{
+  "name": "PSTEC HCUM 전력량계",
+  "country": "KR",
+  "domains": ["sensor"],
+  "render_readme": true
+}
