@@ -392,16 +392,37 @@ class PstecUsageSensor(SensorEntity):
             ]
             if not meter_records:
                 self._baseline = 0.0
+                self._state = 0.0
                 return
-            latest = max(meter_records, key=lambda r: r["date"])
-            rec_v = to_float(latest.get("rec_dev_record", 0))
-            ret_v = to_float(latest.get("ret_dev_record", 0))
-            if self._record_type == "act":
-                self._baseline = rec_v - ret_v
-            elif self._record_type == "rec":
-                self._baseline = rec_v
-            else:
-                self._baseline = ret_v
+
+            # Sort ascending by date so we can pick latest and previous meter readings.
+            meter_records.sort(key=lambda r: r["date"])
+            latest = meter_records[-1]
+            prev = meter_records[-2] if len(meter_records) >= 2 else None
+
+            def _value(rec: Dict[str, Any]) -> float:
+                rec_v = to_float(rec.get("rec_dev_record", 0))
+                ret_v = to_float(rec.get("ret_dev_record", 0))
+                if self._record_type == "act":
+                    return rec_v - ret_v
+                if self._record_type == "rec":
+                    return rec_v
+                return ret_v
+
+            latest_v = _value(latest)
+            self._baseline = latest_v  # keep for reference
+
+            if self._usage_type == "lmon_record":
+                # "지난 검침일 때의 수치" (cumulative at last meter reading)
+                self._state = round(latest_v, 3)
+                return
+
+            # self._usage_type == "lmon": "지난 검침일 - 그 이전 검침일" (usage of last metering cycle)
+            if prev is None:
+                self._state = 0.0
+                return
+            prev_v = _value(prev)
+            self._state = round(max(0.0, latest_v - prev_v), 3)
             return
 
         self._baseline = 0.0
@@ -418,6 +439,14 @@ class PstecUsageSensor(SensorEntity):
                 return float(v)
             except Exception:
                 return default
+
+        # lmon_record: last meter reading cumulative
+        # lmon: last metering cycle usage (difference between last and previous meter readings)
+        if self._usage_type in ("lmon", "lmon_record"):
+            if self._baseline is None or self._state is None:
+                self.update_from_file()
+            # update_from_file already computed the correct state for these types.
+            return
 
         rec_now = to_float_state(f"sensor.{self._device}_rec_dev_record", 0.0)
         ret_now = 0.0
