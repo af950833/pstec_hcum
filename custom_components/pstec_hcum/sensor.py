@@ -291,6 +291,9 @@ class PstecUsageSensor(SensorEntity):
         self._baseline = None
         self._state = None
 
+        # Cache key for file-derived fixed windows (e.g., lday)
+        self._file_state_for_date = None
+
         if usage_type == "lmon_record":
             self._name = f"{self._device}_{record_type}_{usage_type}"
         else:
@@ -347,21 +350,26 @@ class PstecUsageSensor(SensorEntity):
             return
 
         if self._usage_type in ("tday", "lday"):
-            target = now if self._usage_type == "tday" else (now - datetime.timedelta(days=1))
-            target_date = target.strftime("%Y-%m-%d")
-            rec = next((r for r in records if r.get("date") == target_date), None)
+            # Records in the file are snapshots at 00:00 for the given "date".
+            # - tday: today usage so far = current - today's 00:00 baseline (handled in async_update via baseline subtraction)
+            # - lday: yesterday's full-day usage = (today 00:00 snapshot) - (yesterday 00:00 snapshot) (file-derived, fixed)
+            today = now.strftime("%Y-%m-%d")
+            yesterday = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
-            # If baseline record is missing or zero, fall back to latest non-zero record
-            # at or before the target date.
-            if rec is None or to_float(rec.get("rec_dev_record", 0), 0.0) <= 0.0:
-                cand = []
+            def _pick_record_on_or_before(target_date: str):
+                rec0 = next((r for r in records if r.get("date") == target_date), None)
+                if rec0 is not None and to_float(rec0.get("rec_dev_record", 0), 0.0) > 0.0:
+                    return rec0
+
+                # fall back to latest non-zero record at or before target_date
                 try:
                     td = datetime.datetime.strptime(target_date, "%Y-%m-%d").date()
                 except Exception:
-                    td = None
+                    return None
+                cand = []
                 for r in records:
                     d = r.get("date")
-                    if not d or td is None:
+                    if not d:
                         continue
                     try:
                         dd = datetime.datetime.strptime(d, "%Y-%m-%d").date()
@@ -369,20 +377,55 @@ class PstecUsageSensor(SensorEntity):
                         continue
                     if dd <= td and to_float(r.get("rec_dev_record", 0), 0.0) > 0.0:
                         cand.append(r)
-                rec = max(cand, key=lambda r: r["date"]) if cand else None
+                return max(cand, key=lambda r: r["date"]) if cand else None
 
-            if rec is None:
-                self._baseline = 0.0
-            else:
-                rec_v = to_float(rec.get("rec_dev_record", 0))
-                ret_v = to_float(rec.get("ret_dev_record", 0))
-                if self._record_type == "act":
-                    self._baseline = rec_v - ret_v
-                elif self._record_type == "rec":
-                    self._baseline = rec_v
+            if self._usage_type == "tday":
+                # baseline = today's 00:00 snapshot (or nearest non-zero <= today)
+                rec = _pick_record_on_or_before(today)
+                if rec is None:
+                    self._baseline = 0.0
                 else:
-                    self._baseline = ret_v
+                    rec_v = to_float(rec.get("rec_dev_record", 0))
+                    ret_v = to_float(rec.get("ret_dev_record", 0))
+                    if self._record_type == "act":
+                        self._baseline = rec_v - ret_v
+                    elif self._record_type == "rec":
+                        self._baseline = rec_v
+                    else:
+                        self._baseline = ret_v
+                return
+
+            # lday: file-derived fixed value (yesterday full-day usage)
+            # Avoid recomputing unless the "today" date changes.
+            if getattr(self, "_file_state_for_date", None) == today and self._state is not None:
+                return
+
+            rec_today = _pick_record_on_or_before(today)
+            rec_yday = _pick_record_on_or_before(yesterday)
+
+            if rec_today is None or rec_yday is None:
+                self._state = 0.0
+                self._baseline = 0.0
+                self._file_state_for_date = today
+                return
+
+            rec_t = to_float(rec_today.get("rec_dev_record", 0))
+            ret_t = to_float(rec_today.get("ret_dev_record", 0))
+            rec_y = to_float(rec_yday.get("rec_dev_record", 0))
+            ret_y = to_float(rec_yday.get("ret_dev_record", 0))
+
+            if self._record_type == "act":
+                v = (rec_t - ret_t) - (rec_y - ret_y)
+            elif self._record_type == "rec":
+                v = rec_t - rec_y
+            else:
+                v = ret_t - ret_y
+
+            self._state = round(max(0.0, v), 3)
+            self._baseline = 0.0
+            self._file_state_for_date = today
             return
+
 
         if self._usage_type in ("lmon", "lmon_record"):
             meter_records = [r for r in records if r.get("date")]
@@ -446,6 +489,11 @@ class PstecUsageSensor(SensorEntity):
             if self._baseline is None or self._state is None:
                 self.update_from_file()
             # update_from_file already computed the correct state for these types.
+            return
+
+        # lday: yesterday full-day usage is file-derived (fixed), not "since yesterday" usage.
+        if self._usage_type == "lday":
+            self.update_from_file()
             return
 
         rec_now = to_float_state(f"sensor.{self._device}_rec_dev_record", 0.0)
