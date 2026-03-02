@@ -396,10 +396,6 @@ class PstecUsageSensor(SensorEntity):
                 return
 
             # lday: file-derived fixed value (yesterday full-day usage)
-            # Avoid recomputing unless the "today" date changes.
-            if getattr(self, "_file_state_for_date", None) == today and self._state is not None:
-                return
-
             rec_today = _pick_record_on_or_before(today)
             rec_yday = _pick_record_on_or_before(yesterday)
 
